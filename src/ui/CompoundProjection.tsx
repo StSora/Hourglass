@@ -122,6 +122,10 @@ export function CompoundProjection({
   }, [config])
   const extra = comp.finalValue - simple
   const extraPositive = extra >= -1e-6
+  // Compounding's ceiling is ~(apr*T)^2/2 of principal, so at low APR the gain is
+  // small no matter the size — surface that so the operator understands the number.
+  const upliftPct = positionValueUsd > 0 ? extra / positionValueUsd : 0
+  const marginalUplift = extraPositive && upliftPct < 0.005
 
   // Sparkline geometry: normalise both lines to the same band.
   const W = 100
@@ -250,6 +254,13 @@ export function CompoundProjection({
               <span className="text-ink text-xs">{humanDays(activeInterval)}</span>
             </PreviewRow>
           </div>
+
+          {marginalUplift && (
+            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--accent)' }}>
+              Compounding rewards higher-yield positions — at ~{pct(apr)} APR the extra stays small no matter the size;
+              it scales up sharply as the pool's APR rises.
+            </p>
+          )}
 
           <p className="text-[11px] text-faint leading-relaxed flex items-start gap-1.5">
             <span className="mt-0.5 shrink-0">
