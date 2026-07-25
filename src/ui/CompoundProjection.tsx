@@ -1,10 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import {
   projectSimple,
-  projectCompounded,
   projectManual,
+  projectAgentOptimal,
   projectionCurve,
-  nextCompoundEstimateDays,
   type CompoundingConfig,
 } from '../lib/compounding'
 import { IconRepeat, IconGas } from './icons'
@@ -69,6 +68,10 @@ export function CompoundProjection({
   aprIsEstimate = false,
   poolLabel,
   chainId,
+  mode,
+  onModeChange,
+  intervalDays,
+  onIntervalChange,
   enabled,
   onToggle,
 }: {
@@ -77,12 +80,13 @@ export function CompoundProjection({
   aprIsEstimate?: boolean
   poolLabel?: string
   chainId: number
+  mode: Mode
+  onModeChange: (m: Mode) => void
+  intervalDays: number
+  onIntervalChange: (d: number) => void
   enabled: boolean
   onToggle: (v: boolean) => void
 }) {
-  const [mode, setMode] = useState<Mode>('agent')
-  const [intervalDays, setIntervalDays] = useState(30)
-
   const gasUsd = estimateCompoundGasUsd(chainId)
 
   const config = useMemo<CompoundingConfig>(
@@ -92,18 +96,30 @@ export function CompoundProjection({
 
   const hasValue = positionValueUsd > 0 && apr > 0
   const simple = useMemo(() => projectSimple(config, PROJECTION_DAYS), [config])
+  // Agent = the optimal compound schedule (always >= any manual interval).
+  const agentProj = useMemo(() => projectAgentOptimal(config, PROJECTION_DAYS), [config])
   const comp = useMemo(
-    () => (mode === 'agent' ? projectCompounded(config, PROJECTION_DAYS) : projectManual(config, PROJECTION_DAYS, intervalDays)),
-    [config, mode, intervalDays],
+    () => (mode === 'agent' ? agentProj : projectManual(config, PROJECTION_DAYS, intervalDays)),
+    [mode, agentProj, config, intervalDays],
   )
-  const nextDays = useMemo(
-    () => (mode === 'agent' ? nextCompoundEstimateDays(config, PROJECTION_DAYS) : intervalDays),
-    [config, mode, intervalDays],
-  )
-  const curve = useMemo(
-    () => projectionCurve(config, PROJECTION_DAYS, 32, mode === 'manual' ? intervalDays : undefined),
-    [config, mode, intervalDays],
-  )
+  // Interval driving the "next compound" line and the curve — the agent uses its
+  // own optimal interval.
+  const activeInterval = mode === 'agent' ? agentProj.intervalDays : intervalDays
+  const curveInterval = Number.isFinite(activeInterval) ? activeInterval : PROJECTION_DAYS + 1
+  const curve = useMemo(() => projectionCurve(config, PROJECTION_DAYS, 32, curveInterval), [config, curveInterval])
+  // Best of the manual intervals → flagged "best" in the Manual selector.
+  const bestManualKey = useMemo(() => {
+    let key = INTERVALS[0].key
+    let fv = -Infinity
+    for (const i of INTERVALS) {
+      const v = projectManual(config, PROJECTION_DAYS, Number(i.key)).finalValue
+      if (v > fv) {
+        fv = v
+        key = i.key
+      }
+    }
+    return key
+  }, [config])
   const extra = comp.finalValue - simple
   const extraPositive = extra >= -1e-6
 
@@ -156,15 +172,25 @@ export function CompoundProjection({
                 { key: 'manual', label: 'Manual' },
               ]}
               value={mode}
-              onChange={(v) => setMode(v)}
+              onChange={(v) => onModeChange(v)}
             />
             {mode === 'manual' && (
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-[11px] text-faint">every</span>
                 <Segmented
-                  options={INTERVALS.map((i) => ({ key: i.key, label: i.label }))}
+                  options={INTERVALS.map((i) => ({
+                    key: i.key,
+                    label:
+                      i.key === bestManualKey ? (
+                        <>
+                          {i.label} <span style={{ color: 'var(--accent)' }}>· best</span>
+                        </>
+                      ) : (
+                        i.label
+                      ),
+                  }))}
                   value={String(intervalDays)}
-                  onChange={(v) => setIntervalDays(Number(v))}
+                  onChange={(v) => onIntervalChange(Number(v))}
                 />
               </div>
             )}
@@ -220,14 +246,8 @@ export function CompoundProjection({
             <PreviewRow label="Compounds / yr">
               <span className="font-mono text-ink tnum text-xs">{comp.compounds}×</span>
             </PreviewRow>
-            <PreviewRow label={mode === 'agent' ? 'Next compound' : 'Every'}>
-              <span className="text-ink text-xs">{mode === 'agent' ? humanDays(nextDays) : humanDays(intervalDays)}</span>
-            </PreviewRow>
-            <PreviewRow label="Gas / compound">
-              <span className="font-mono text-dim tnum text-xs">
-                {usd(gasUsd)}
-                <span className="text-faint"> · est.</span>
-              </span>
+            <PreviewRow label={mode === 'agent' ? 'Optimal every' : 'Every'}>
+              <span className="text-ink text-xs">{humanDays(activeInterval)}</span>
             </PreviewRow>
           </div>
 
@@ -237,8 +257,8 @@ export function CompoundProjection({
             </span>
             <span>
               {mode === 'agent'
-                ? "The agent reinvests fees only when the extra yield they'll earn beats the gas — so a small or low-yield position waits and a large one runs often, never at a loss."
-                : 'Compounds on your fixed schedule regardless of gas — switch to Agent to let it optimise and never lose to gas.'}{' '}
+                ? 'The agent picks the compound frequency that maximises return after gas — at least as good as any fixed schedule, never at a loss.'
+                : 'Compounds on your fixed schedule regardless of gas — switch to Agent to let it optimise the frequency for you.'}{' '}
               Figures are estimates.
             </span>
           </p>

@@ -4,13 +4,19 @@ import { createPublicClient, http, isAddress, parseUnits, formatUnits, erc20Abi,
 import { useUniswapPools } from '../hooks/useUniswapPools'
 import { buildDepositPlan } from '../lib/uniswapPosition'
 import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
+import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode } from '../lib/compoundDelegation'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
 import { getAddresses } from '../config/addresses'
+import { UNISWAP_V3_POSITION_MANAGER } from '../config/uniswap'
 import { DeleGatorModuleFactoryABI } from '../config/abis'
 import { DEFAULT_SALT } from '../lib/module'
 import { findChain, rpcUrl } from '../config/supported-chains'
 import type { PoolInfo } from '../lib/uniswapDiscovery'
+import type { StoredDelegation } from '../lib/storage'
+
+/** The signed yield plan, optionally carrying the auto-compound mandate. */
+type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredDelegation }
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
 import { Block, Field } from '../ui/form'
 import { CompoundProjection } from '../ui/CompoundProjection'
@@ -73,8 +79,10 @@ export default function Yield() {
   const [step, setStep] = useState<DelegateStep>('idle')
   const [signingIndex, setSigningIndex] = useState(0)
   const [planError, setPlanError] = useState<string | null>(null)
-  const [storedPlan, setStoredPlan] = useState<StoredYieldPlan | null>(null)
+  const [storedPlan, setStoredPlan] = useState<YieldPlanWithCompound | null>(null)
   const [autoCompound, setAutoCompound] = useState(false)
+  const [compoundMode, setCompoundMode] = useState<CompoundMode>('agent')
+  const [compoundIntervalDays, setCompoundIntervalDays] = useState(30)
 
   const recommended = pools[0] ?? null
   const pool = selectedPool ?? recommended
@@ -184,17 +192,48 @@ export default function Yield() {
         signatures.push((result?.signature || result?.safeTxHash || '0x') as Hex)
       }
 
-      setStoredPlan(
-        buildStoredYieldPlan({
-          plan,
-          yieldDelegations,
-          signatures,
+      let finalPlan: YieldPlanWithCompound = buildStoredYieldPlan({
+        plan,
+        yieldDelegations,
+        signatures,
+        chainId: safe.chainId,
+        safeAddress,
+        moduleAddress,
+        agentAddress,
+      })
+
+      // If the operator enabled auto-compound, sign one more standing delegation —
+      // bounded to collect + increaseLiquidity on this pool's PositionManager — and
+      // attach it to the plan. The agent redeems it repeatedly to harvest+reinvest.
+      if (autoCompound) {
+        const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
+        if (!positionManager) throw new Error(`Uniswap PositionManager not configured for chain ${safe.chainId}`)
+        const mandate = buildCompoundMandate({
           chainId: safe.chainId,
-          safeAddress,
-          moduleAddress,
           agentAddress,
-        }),
-      )
+          moduleAddress,
+          safeAddress,
+          positionManager,
+          pool: pool.poolAddress,
+          mode: compoundMode,
+          intervalDays: compoundMode === 'manual' ? compoundIntervalDays : undefined,
+        })
+        setSigningIndex(yieldDelegations.length)
+        await sleep(SIGN_SETTLE_MS)
+        const typedData = buildDelegationTypedData(mandate.delegation, safe.chainId)
+        const result = (await withTimeout(
+          sdk.txs.signTypedMessage(typedData as never),
+          SIGN_TIMEOUT_MS,
+          "Timed out waiting for the auto-compound signature. Check your wallet or the Safe app's Messages tab, then try again.",
+        )) as { signature?: Hex; safeTxHash?: Hex }
+        const signature = (result?.signature || result?.safeTxHash || '0x') as Hex
+        finalPlan = {
+          ...finalPlan,
+          compound: buildStoredCompoundDelegation({ mandate, signature, chainId: safe.chainId, safeAddress, moduleAddress }),
+        }
+      }
+
+      setStoredPlan(finalPlan)
       setStep('done')
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : 'Failed to build the delegation plan')
@@ -343,6 +382,10 @@ export default function Yield() {
             aprIsEstimate={aprIsEstimate}
             poolLabel={`${pool.token0.symbol}/${pool.token1.symbol} · ${feeLabel(pool.fee)}`}
             chainId={safe.chainId}
+            mode={compoundMode}
+            onModeChange={setCompoundMode}
+            intervalDays={compoundIntervalDays}
+            onIntervalChange={setCompoundIntervalDays}
             enabled={autoCompound}
             onToggle={setAutoCompound}
           />
@@ -356,7 +399,7 @@ export default function Yield() {
           {step === 'done' && storedPlan ? (
             <div className="rounded-xl glass-soft ring-1 ring-line p-4 space-y-3">
               <div className="flex items-center gap-2 text-sm font-medium text-active">
-                <IconCheck size={16} /> Plan signed — 3 delegations ready for the agent.
+                <IconCheck size={16} /> Plan signed — {storedPlan.compound ? '3 delegations + auto-compound' : '3 delegations'} ready for the agent.
               </div>
               <div className="text-xs text-dim">
                 Agent wallet: <Mono>{short(storedPlan.agentAddress)}</Mono>
@@ -370,7 +413,11 @@ export default function Yield() {
             </div>
           ) : (
             <Btn kind="primary" size="lg" onClick={handleDelegate} disabled={!canDelegate || step !== 'idle'}>
-              {step === 'preparing' ? 'Preparing…' : step === 'signing' ? `Signing ${signingIndex + 1} of 3…` : 'Sign delegations'}
+              {step === 'preparing'
+                ? 'Preparing…'
+                : step === 'signing'
+                  ? `Signing ${signingIndex + 1} of ${autoCompound ? 4 : 3}…`
+                  : 'Sign delegations'}
             </Btn>
           )}
           </div>

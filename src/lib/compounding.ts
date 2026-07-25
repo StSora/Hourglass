@@ -189,6 +189,45 @@ export function projectManual(
   return { finalValue, compounds, totalGas, effectiveApr }
 }
 
+export interface AgentProjection extends CompoundedProjection {
+  /** Optimal compound interval the agent targets, in days (Infinity = never — hold). */
+  intervalDays: number
+}
+
+/**
+ * The agent's optimal plan. Searches compound intervals and picks the one that
+ * maximises final value — balancing yield-on-yield against gas. By construction this
+ * is at least as good as any fixed manual schedule (a manual interval is just one of
+ * the candidates). The naive "compound whenever benefit > gas" rule over-compounds
+ * early (long horizon makes even tiny fees clear the bar) and is NOT optimal — this
+ * is the fix for "manual beats the agent".
+ */
+export function projectAgentOptimal(config: CompoundingConfig, horizonDays: number): AgentProjection {
+  validate(config)
+  if (horizonDays < 0) throw new Error('horizonDays must be >= 0')
+  const days = Math.floor(horizonDays)
+
+  // Baseline candidate: never compound (hold).
+  const holdValue = projectSimple(config, days)
+  const years = days / DAYS_PER_YEAR
+  const holdApr = years > 0 && config.principal > 0 ? Math.pow(holdValue / config.principal, 1 / years) - 1 : 0
+  let best: AgentProjection = {
+    finalValue: holdValue,
+    compounds: 0,
+    totalGas: 0,
+    effectiveApr: holdApr,
+    intervalDays: Infinity,
+  }
+
+  for (let interval = 1; interval <= days; interval += 1) {
+    const p = projectManual(config, days, interval)
+    if (p.finalValue > best.finalValue) {
+      best = { ...p, intervalDays: interval }
+    }
+  }
+  return best
+}
+
 export interface ProjectionPoint {
   day: number
   simple: number

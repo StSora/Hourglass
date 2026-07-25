@@ -19,6 +19,7 @@ import {
   projectSimple,
   projectCompounded,
   projectManual,
+  projectAgentOptimal,
   projectionCurve,
   type CompoundingConfig,
 } from '../../src/lib/compounding'
@@ -113,6 +114,32 @@ describe('manual (fixed-schedule) mode', () => {
   })
   test('a sensible schedule beats hold', () => {
     expect(projectManual(c, 365, 90).finalValue).toBeGreaterThan(projectSimple(c, 365))
+  })
+})
+
+describe('agent optimizer — must beat every manual schedule', () => {
+  const c = cfg(34_650, 0.05) // the case where greedy compounding lost to monthly
+
+  test('agent >= hold and >= any fixed manual interval', () => {
+    const agent = projectAgentOptimal(c, 365)
+    const hold = projectSimple(c, 365)
+    expect(agent.finalValue).toBeGreaterThanOrEqual(hold - 1e-6)
+    for (const interval of [7, 30, 90]) {
+      expect(agent.finalValue).toBeGreaterThanOrEqual(projectManual(c, 365, interval).finalValue - 1e-6)
+    }
+  })
+
+  test('the optimizer does NOT just compound as often as possible (that was the bug)', () => {
+    const agent = projectAgentOptimal(c, 365)
+    const daily = projectManual(c, 365, 1)
+    expect(agent.finalValue).toBeGreaterThan(daily.finalValue) // fewer, better-timed compounds win
+    expect(agent.compounds).toBeLessThan(daily.compounds)
+    expect(Number.isFinite(agent.intervalDays)).toBe(true)
+  })
+
+  test('a tiny position: holding can be optimal (interval = Infinity)', () => {
+    const agent = projectAgentOptimal(cfg(200, 0.05), 365)
+    expect(agent.finalValue).toBeGreaterThanOrEqual(projectSimple(cfg(200, 0.05), 365) - 1e-6)
   })
 })
 
