@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   projectSimple,
   projectCompounded,
@@ -30,13 +30,11 @@ function estimateCompoundGasUsd(chainId: number): number {
   return COMPOUND_GAS_USD_BY_CHAIN[chainId] ?? DEFAULT_COMPOUND_GAS_USD
 }
 
-type Mode = 'agent' | 'manual'
+// The projection always looks a year ahead — a standard forecast window. It is not
+// a schedule; the only schedule input is the Manual interval below.
+const PROJECTION_DAYS = 365
 
-const HORIZONS: { key: string; label: string }[] = [
-  { key: '30', label: '1M' },
-  { key: '90', label: '3M' },
-  { key: '365', label: '1Y' },
-]
+type Mode = 'agent' | 'manual'
 
 const INTERVALS: { key: string; label: string }[] = [
   { key: '7', label: 'Weekly' },
@@ -61,9 +59,9 @@ function humanDays(d: number): string {
 /**
  * Auto-compound projection card for the Yield flow, bound to the selected pool.
  * Two cadence modes: "agent" lets the gas-aware gate decide when to compound;
- * "manual" compounds on a fixed schedule the operator picks. The toggle records the
- * operator's intent; the compound delegation it will add to the plan is wired
- * separately (the compound delegation + agent runner).
+ * "manual" compounds on a fixed schedule the operator picks. The projection always
+ * looks a year ahead. The toggle records the operator's intent; the compound
+ * delegation it will add to the plan is wired separately.
  */
 export function CompoundProjection({
   positionValueUsd,
@@ -82,44 +80,29 @@ export function CompoundProjection({
   enabled: boolean
   onToggle: (v: boolean) => void
 }) {
-  const [horizonDays, setHorizonDays] = useState(365)
   const [mode, setMode] = useState<Mode>('agent')
   const [intervalDays, setIntervalDays] = useState(30)
 
   const gasUsd = estimateCompoundGasUsd(chainId)
-
-  // Only offer intervals that fit inside the projection window — a longer interval
-  // would never fire (e.g. quarterly over a 1-month window = 0 compounds).
-  const availableIntervals = INTERVALS.filter((i) => Number(i.key) <= horizonDays)
-  useEffect(() => {
-    if (intervalDays > horizonDays) {
-      const fits = availableIntervals.map((i) => Number(i.key))
-      setIntervalDays(fits.length ? Math.max(...fits) : Number(INTERVALS[0].key))
-    }
-  }, [horizonDays, intervalDays, availableIntervals])
 
   const config = useMemo<CompoundingConfig>(
     () => ({ principal: positionValueUsd, apr, gasCost: gasUsd }),
     [positionValueUsd, apr, gasUsd],
   )
 
-  // In Agent mode the agent picks the moment, so there is no user schedule — the
-  // projection is a fixed 1-year forecast. Manual mode exposes the horizon + interval.
-  const effectiveHorizon = mode === 'agent' ? 365 : horizonDays
-
   const hasValue = positionValueUsd > 0 && apr > 0
-  const simple = useMemo(() => projectSimple(config, effectiveHorizon), [config, effectiveHorizon])
+  const simple = useMemo(() => projectSimple(config, PROJECTION_DAYS), [config])
   const comp = useMemo(
-    () => (mode === 'agent' ? projectCompounded(config, effectiveHorizon) : projectManual(config, effectiveHorizon, intervalDays)),
-    [config, effectiveHorizon, mode, intervalDays],
+    () => (mode === 'agent' ? projectCompounded(config, PROJECTION_DAYS) : projectManual(config, PROJECTION_DAYS, intervalDays)),
+    [config, mode, intervalDays],
   )
   const nextDays = useMemo(
-    () => (mode === 'agent' ? nextCompoundEstimateDays(config, effectiveHorizon) : intervalDays),
-    [config, effectiveHorizon, mode, intervalDays],
+    () => (mode === 'agent' ? nextCompoundEstimateDays(config, PROJECTION_DAYS) : intervalDays),
+    [config, mode, intervalDays],
   )
   const curve = useMemo(
-    () => projectionCurve(config, effectiveHorizon, 32, mode === 'manual' ? intervalDays : undefined),
-    [config, effectiveHorizon, mode, intervalDays],
+    () => projectionCurve(config, PROJECTION_DAYS, 32, mode === 'manual' ? intervalDays : undefined),
+    [config, mode, intervalDays],
   )
   const extra = comp.finalValue - simple
   const extraPositive = extra >= -1e-6
@@ -166,7 +149,7 @@ export function CompoundProjection({
         <p className="text-xs text-faint">Enter amounts to see the projection.</p>
       ) : (
         <>
-          <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3 flex-wrap">
             <Segmented
               options={[
                 { key: 'agent', label: 'Agent' },
@@ -176,30 +159,22 @@ export function CompoundProjection({
               onChange={(v) => setMode(v)}
             />
             {mode === 'manual' && (
-              <Segmented
-                options={HORIZONS.map((h) => ({ key: h.key, label: h.label }))}
-                value={String(horizonDays)}
-                onChange={(v) => setHorizonDays(Number(v))}
-              />
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[11px] text-faint">every</span>
+                <Segmented
+                  options={INTERVALS.map((i) => ({ key: i.key, label: i.label }))}
+                  value={String(intervalDays)}
+                  onChange={(v) => setIntervalDays(Number(v))}
+                />
+              </div>
             )}
           </div>
-
-          {mode === 'manual' && (
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[11px] text-faint">Compound every</span>
-              <Segmented
-                options={availableIntervals.map((i) => ({ key: i.key, label: i.label }))}
-                value={String(intervalDays)}
-                onChange={(v) => setIntervalDays(Number(v))}
-              />
-            </div>
-          )}
 
           <div className="grid grid-cols-2 gap-3">
             <div className="rounded-lg glass ring-1 ring-line p-3">
               <div className="text-[11px] text-faint uppercase tracking-wide">Hold</div>
               <div className="font-mono text-lg text-dim tnum mt-1">{usd(simple)}</div>
-              <div className="text-[11px] text-faint mt-0.5">no compounding</div>
+              <div className="text-[11px] text-faint mt-0.5">no compounding · 1y</div>
             </div>
             <div
               className="rounded-lg ring-1 p-3"
@@ -212,7 +187,7 @@ export function CompoundProjection({
                 className="text-[11px] uppercase tracking-wide"
                 style={{ color: extraPositive ? 'var(--accent)' : 'var(--color-danger)' }}
               >
-                {mode === 'agent' ? 'Auto-compound' : 'Manual'}
+                {mode === 'agent' ? 'Auto-compound' : 'Manual'} · 1y
               </div>
               <div className="font-mono text-lg text-ink tnum mt-1">{usd(comp.finalValue)}</div>
               <div
@@ -242,7 +217,7 @@ export function CompoundProjection({
                 {aprIsEstimate && <span className="text-faint"> · est.</span>}
               </span>
             </PreviewRow>
-            <PreviewRow label="Compounds">
+            <PreviewRow label="Compounds / yr">
               <span className="font-mono text-ink tnum text-xs">{comp.compounds}×</span>
             </PreviewRow>
             <PreviewRow label={mode === 'agent' ? 'Next compound' : 'Every'}>
