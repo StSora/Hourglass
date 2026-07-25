@@ -1,8 +1,10 @@
 /**
- * The property this suite protects: the compound gate is profitability-driven, so a
- * small treasury waits (gas would eat the harvest) and a large one runs often. If
- * that inverts, the agent starts compounding at a loss for small positions. The two
- * worked examples below are the ones the team signed off on.
+ * The properties this suite protects:
+ *   1. Auto-compound is NEVER worse than holding (the gate only fires when the
+ *      reinvested fees earn back more than the gas). A regression here is exactly
+ *      the "-$48.91 extra" bug this replaced.
+ *   2. The cadence scales: a small / low-APR position waits, a large / high-APR one
+ *      compounds often.
  *
  * Run: bun test test/unit
  */
@@ -10,124 +12,125 @@ import { describe, test, expect } from 'bun:test'
 import {
   dailyAccrual,
   costPerCompound,
+  compoundBenefit,
+  compoundThreshold,
   shouldCompound,
-  breakEvenIntervalDays,
   nextCompoundEstimateDays,
-  netReinvested,
   projectSimple,
   projectCompounded,
+  projectManual,
   projectionCurve,
   type CompoundingConfig,
 } from '../../src/lib/compounding'
 
-// 10K position yielding ~$0.20/day; gas $0.15. Threshold M=10 -> compound weekly.
-const SMALL: CompoundingConfig = {
-  principal: 10_000,
-  apr: (0.2 * 365) / 10_000, // ~0.73% APR, i.e. $0.20/day
-  gasCost: 0.15,
-  costMultiple: 10,
-}
-
-// 10M position yielding ~$2,000/day; gas $0.15. Threshold cleared in minutes.
-const LARGE: CompoundingConfig = {
-  principal: 10_000_000,
-  apr: (2000 * 365) / 10_000_000, // ~7.3% APR, i.e. $2,000/day
-  gasCost: 0.15,
-  costMultiple: 10,
-}
+const GAS = 0.15
+const cfg = (principal: number, apr: number): CompoundingConfig => ({ principal, apr, gasCost: GAS })
 
 describe('accrual and cost', () => {
-  test('dailyAccrual matches the position economics', () => {
-    expect(dailyAccrual(SMALL)).toBeCloseTo(0.2, 6)
-    expect(dailyAccrual(LARGE)).toBeCloseTo(2000, 3)
+  test('dailyAccrual is principal * apr / 365', () => {
+    expect(dailyAccrual(cfg(6000, 0.05))).toBeCloseTo((6000 * 0.05) / 365, 6)
   })
-
   test('costPerCompound sums gas and fixed fee', () => {
-    expect(costPerCompound(SMALL)).toBeCloseTo(0.15, 6)
-    expect(costPerCompound({ ...SMALL, fixedFee: 0.05 })).toBeCloseTo(0.2, 6)
+    expect(costPerCompound(cfg(6000, 0.05))).toBeCloseTo(0.15, 6)
+    expect(costPerCompound({ ...cfg(6000, 0.05), fixedFee: 0.05 })).toBeCloseTo(0.2, 6)
   })
 })
 
-describe('the gate', () => {
-  test('waits below the threshold, fires at or above it', () => {
-    expect(shouldCompound(1.49, SMALL)).toBe(false) // 10 * 0.15 = 1.50
-    expect(shouldCompound(1.5, SMALL)).toBe(true)
-    expect(shouldCompound(0, SMALL)).toBe(false)
+describe('the benefit-aware gate', () => {
+  const c = cfg(6000, 0.05) // threshold over 365d = 0.15 / (0.05 * 1) = $3
+
+  test('marginal benefit is accrued * apr * remaining/year', () => {
+    expect(compoundBenefit(100, 365, c)).toBeCloseTo(5, 6) // 100 * 0.05 * 1
+    expect(compoundBenefit(100, 182.5, c)).toBeCloseTo(2.5, 6)
   })
 
-  test('daily gas would eat the small harvest, so it does NOT fire daily', () => {
-    expect(shouldCompound(dailyAccrual(SMALL), SMALL)).toBe(false)
+  test('fires only when benefit beats gas over the remaining horizon', () => {
+    expect(compoundThreshold(c, 365)).toBeCloseTo(3, 6)
+    expect(shouldCompound(2.99, 365, c)).toBe(false)
+    expect(shouldCompound(3.01, 365, c)).toBe(true)
+    expect(shouldCompound(0, 365, c)).toBe(false)
   })
 
-  test('one day of accrual on the large position clears the gate immediately', () => {
-    expect(shouldCompound(dailyAccrual(LARGE), LARGE)).toBe(true)
-  })
-})
-
-describe('cadence — small waits, large runs', () => {
-  test('small treasury compounds about weekly', () => {
-    const days = breakEvenIntervalDays(SMALL)
-    expect(days).toBeCloseTo(7.5, 1) // 1.50 / 0.20
-    expect(days).toBeGreaterThan(1)
+  test('near the end of the horizon it takes far more accrued to justify gas', () => {
+    // 10 days left: threshold = 0.15 / (0.05 * 10/365) ~= $109.5
+    expect(compoundThreshold(c, 10)).toBeGreaterThan(100)
+    expect(shouldCompound(3, 10, c)).toBe(false) // would have fired with 365 left
   })
 
-  test('large treasury compounds well within a day', () => {
-    expect(breakEvenIntervalDays(LARGE)).toBeLessThan(1)
-  })
-
-  test('cadence is inversely proportional to position size', () => {
-    expect(breakEvenIntervalDays(SMALL)).toBeGreaterThan(breakEvenIntervalDays(LARGE))
-  })
-
-  test('nextCompoundEstimate shrinks as yield accrues', () => {
-    const fromZero = nextCompoundEstimateDays(SMALL, 0)
-    const halfway = nextCompoundEstimateDays(SMALL, 0.75)
-    expect(fromZero).toBeCloseTo(7.5, 1)
-    expect(halfway).toBeLessThan(fromZero)
-    expect(nextCompoundEstimateDays(SMALL, 2)).toBe(0) // already past threshold
+  test('a zero-APR position never compounds', () => {
+    expect(shouldCompound(1000, 365, cfg(6000, 0))).toBe(false)
   })
 })
 
-describe('net reinvested and fees', () => {
-  test('deducts cost and performance fee from the harvest', () => {
-    expect(netReinvested(2, { ...SMALL, performanceFeeRate: 0.1 })).toBeCloseTo(1.665, 6)
-  })
+describe('never at a loss — auto-compound >= hold', () => {
+  const cases: [string, number, number][] = [
+    ['user: $6000 @ 5%', 6000, 0.05],
+    ['$6000 @ 20%', 6000, 0.2],
+    ['$6000 @ 50%', 6000, 0.5],
+    ['$1M @ 5%', 1_000_000, 0.05],
+    ['tiny $200 @ 5%', 200, 0.05],
+  ]
+  for (const [name, principal, apr] of cases) {
+    test(name, () => {
+      const c = cfg(principal, apr)
+      const hold = projectSimple(c, 365)
+      const auto = projectCompounded(c, 365)
+      expect(auto.finalValue).toBeGreaterThanOrEqual(hold - 1e-6) // never below hold
+    })
+  }
+})
 
-  test('never reinvests a negative amount', () => {
-    expect(netReinvested(0.1, SMALL)).toBe(0)
+describe('cadence scales with size and APR', () => {
+  test('a tiny position waits (few or no compounds)', () => {
+    const { compounds } = projectCompounded(cfg(200, 0.05), 365)
+    expect(compounds).toBeLessThan(5)
+  })
+  test('a high-APR position compounds often', () => {
+    const { compounds } = projectCompounded(cfg(6000, 0.5), 365)
+    expect(compounds).toBeGreaterThan(100)
+  })
+  test('higher APR => more uplift over hold', () => {
+    const lowUplift = projectCompounded(cfg(6000, 0.05), 365).finalValue - projectSimple(cfg(6000, 0.05), 365)
+    const highUplift = projectCompounded(cfg(6000, 0.5), 365).finalValue - projectSimple(cfg(6000, 0.5), 365)
+    expect(highUplift).toBeGreaterThan(lowUplift)
+  })
+  test('effectiveApr >= nominal apr (compounding never drags it down)', () => {
+    const { effectiveApr } = projectCompounded(cfg(6000, 0.2), 365)
+    expect(effectiveApr).toBeGreaterThanOrEqual(0.2 - 1e-9)
   })
 })
 
-describe('projections', () => {
-  test('simple projection is linear yield with no gas', () => {
-    expect(projectSimple(LARGE, 365)).toBeCloseTo(10_000_000 * (1 + LARGE.apr), 2)
+describe('manual (fixed-schedule) mode', () => {
+  const c = cfg(6000, 0.05)
+  test('a too-tight schedule can lose to gas (unlike the agent gate)', () => {
+    const hold = projectSimple(c, 365)
+    const weekly = projectManual(c, 365, 7)
+    // agent never dips below hold; a fixed weekly schedule at 5% can, and that is
+    // exactly what the card surfaces in red.
+    expect(projectCompounded(c, 365).finalValue).toBeGreaterThanOrEqual(hold - 1e-6)
+    expect(weekly.finalValue).toBeLessThan(hold)
+    expect(weekly.compounds).toBe(52)
   })
-
-  test('compounding beats simple for a large position over a year', () => {
-    const simple = projectSimple(LARGE, 365)
-    const { finalValue, compounds } = projectCompounded(LARGE, 365)
-    expect(finalValue).toBeGreaterThan(simple)
-    expect(compounds).toBeGreaterThan(300)
+  test('a sensible schedule beats hold', () => {
+    expect(projectManual(c, 365, 90).finalValue).toBeGreaterThan(projectSimple(c, 365))
   })
+})
 
-  test('small position compounds rarely (agent refuses to burn gas)', () => {
-    const { compounds } = projectCompounded(SMALL, 365)
-    expect(compounds).toBeLessThan(60)
-    expect(compounds).toBeGreaterThan(0)
+describe('estimates for the card', () => {
+  test('nextCompoundEstimate shrinks as fees accrue and is 0 past the threshold', () => {
+    const c = cfg(6000, 0.05)
+    const fromZero = nextCompoundEstimateDays(c, 365, 0)
+    expect(fromZero).toBeGreaterThan(0)
+    expect(nextCompoundEstimateDays(c, 365, 1)).toBeLessThan(fromZero)
+    expect(nextCompoundEstimateDays(c, 365, 5)).toBe(0)
   })
-
-  test('effectiveApr exceeds the nominal apr when compounding is active', () => {
-    const { effectiveApr } = projectCompounded(LARGE, 365)
-    expect(effectiveApr).toBeGreaterThan(LARGE.apr)
-  })
-
-  test('projectionCurve is monotonic and ends at the horizon', () => {
-    const curve = projectionCurve(LARGE, 365, 12)
+  test('projectionCurve is monotonic, ends at the horizon, compounded >= simple', () => {
+    const curve = projectionCurve(cfg(6000, 0.5), 365, 12)
     expect(curve[0].day).toBe(0)
     expect(curve[curve.length - 1].day).toBe(365)
     for (let i = 1; i < curve.length; i += 1) {
-      expect(curve[i].compounded).toBeGreaterThanOrEqual(curve[i - 1].compounded)
-      expect(curve[i].compounded).toBeGreaterThanOrEqual(curve[i].simple)
+      expect(curve[i].compounded).toBeGreaterThanOrEqual(curve[i - 1].compounded - 1e-6)
+      expect(curve[i].compounded).toBeGreaterThanOrEqual(curve[i].simple - 1e-6)
     }
   })
 })

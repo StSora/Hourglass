@@ -2,15 +2,18 @@
  * Gas-aware auto-compounding economics — pure, side-effect-free.
  *
  * Shared core for both the agent's compound gate and the app's projection card.
- * The agent compounds accrued yield back into principal only when it is
- * net-profitable after cost, so small treasuries compound rarely and large ones
- * often — the cadence falls out of the numbers, it is never hardcoded.
+ * The rule that makes it "never at a loss": reinvest accrued fees only when the
+ * marginal benefit — the extra yield those fees earn over the remaining horizon —
+ * exceeds the gas of doing it. So a small / low-APR position compounds rarely (or
+ * never) and a large / high-APR one compounds often. The cadence falls out of the
+ * numbers, it is never hardcoded.
  *
- * See docs plan: "Gas-aware auto-compounding". All amounts are in base-token units
- * (e.g. USDC); `apr` is an annual fraction (0.05 = 5%).
+ * All amounts are in base-token units (e.g. USD); `apr` is an annual fraction
+ * (0.05 = 5%).
  */
 
 const DAYS_PER_YEAR = 365
+const DEFAULT_HORIZON_DAYS = 365
 
 export interface CompoundingConfig {
   /** Position size in base-token units. */
@@ -21,19 +24,18 @@ export interface CompoundingConfig {
   gasCost: number
   /** Fixed protocol/relayer fee per compound, base-token units. Default 0. */
   fixedFee?: number
-  /** Performance fee as a fraction of net yield, taken at compound. Default 0. */
-  performanceFeeRate?: number
-  /** Safety multiple: compound only when accrued >= costMultiple * cost. Default 10. */
-  costMultiple?: number
+  /**
+   * Reference horizon (days) the live gate assumes when deciding whether a compound
+   * pays off — the mandate window, say. The projection uses the actual remaining
+   * horizon instead. Default 365.
+   */
+  horizonDays?: number
 }
-
-const DEFAULT_COST_MULTIPLE = 10
 
 function validate(config: CompoundingConfig): void {
   if (config.principal < 0) throw new Error('principal must be >= 0')
   if (config.apr < 0) throw new Error('apr must be >= 0')
   if (config.gasCost < 0) throw new Error('gasCost must be >= 0')
-  if ((config.costMultiple ?? DEFAULT_COST_MULTIPLE) <= 0) throw new Error('costMultiple must be > 0')
 }
 
 /** Daily yield accrued on the current principal (linear within a day). */
@@ -49,48 +51,46 @@ export function costPerCompound(config: CompoundingConfig): number {
 }
 
 /**
- * The gate. True when the accrued yield clears the cost multiple — i.e. gas + fee
- * is a small enough fraction of what is being reinvested to be worth it.
+ * The marginal benefit of compounding: extra value earned by reinvesting `accrued`
+ * now and letting it work for `remainingDays` at `apr`. This is the yield-on-yield
+ * that compounding adds — the thing that must beat the gas.
  */
-export function shouldCompound(accrued: number, config: CompoundingConfig): boolean {
-  const cost = costPerCompound(config)
-  if (accrued <= 0) return false
-  if (cost <= 0) return true
-  const m = config.costMultiple ?? DEFAULT_COST_MULTIPLE
-  return accrued >= m * cost
+export function compoundBenefit(accrued: number, remainingDays: number, config: CompoundingConfig): number {
+  return accrued * config.apr * (remainingDays / DAYS_PER_YEAR)
 }
 
 /**
- * Break-even interval in days: how long until accrued yield first clears the gate,
- * starting from zero. Inversely proportional to position size. Infinity if no yield.
+ * The gate. True only when the marginal benefit over the remaining horizon exceeds
+ * the cost — i.e. reinvesting these fees will earn back more than the gas spent.
+ * This is what guarantees a compound never loses money versus simply holding.
  */
-export function breakEvenIntervalDays(config: CompoundingConfig): number {
-  const perDay = dailyAccrual(config)
-  if (perDay <= 0) return Infinity
-  const m = config.costMultiple ?? DEFAULT_COST_MULTIPLE
-  return (m * costPerCompound(config)) / perDay
+export function shouldCompound(accrued: number, remainingDays: number, config: CompoundingConfig): boolean {
+  if (accrued <= 0 || config.apr <= 0) return false
+  return compoundBenefit(accrued, remainingDays, config) > costPerCompound(config)
+}
+
+/** Accrued fees needed before a compound pays for itself over `remainingDays`. */
+export function compoundThreshold(config: CompoundingConfig, remainingDays: number): number {
+  validate(config)
+  const denom = config.apr * (remainingDays / DAYS_PER_YEAR)
+  if (denom <= 0) return Infinity
+  return costPerCompound(config) / denom
 }
 
 /**
- * Days until the next compound, given yield already accrued since the last one.
- * Zero if the gate is already cleared. For the app's "next compound ~in X days".
+ * Days until the next compound: how long until accrued fees reach the threshold that
+ * justifies the gas over `remainingDays`. Inversely related to size and APR — for
+ * the app's "next compound ~in X days".
  */
-export function nextCompoundEstimateDays(config: CompoundingConfig, accruedSoFar = 0): number {
+export function nextCompoundEstimateDays(
+  config: CompoundingConfig,
+  remainingDays: number = config.horizonDays ?? DEFAULT_HORIZON_DAYS,
+  accruedSoFar = 0,
+): number {
   const perDay = dailyAccrual(config)
   if (perDay <= 0) return Infinity
-  const m = config.costMultiple ?? DEFAULT_COST_MULTIPLE
-  const remaining = m * costPerCompound(config) - accruedSoFar
+  const remaining = compoundThreshold(config, remainingDays) - accruedSoFar
   return remaining <= 0 ? 0 : remaining / perDay
-}
-
-/**
- * Amount reinvested into principal when compounding `accrued`: yield minus the
- * absolute cost, minus the performance fee on the net. Floored at 0.
- */
-export function netReinvested(accrued: number, config: CompoundingConfig): number {
-  const net = accrued - costPerCompound(config)
-  if (net <= 0) return 0
-  return net * (1 - (config.performanceFeeRate ?? 0))
 }
 
 /** Value of holding without ever compounding: linear yield, no gas spent. */
@@ -106,41 +106,36 @@ export interface CompoundedProjection {
   /** Number of compounds performed. */
   compounds: number
   /** Total gas + fixed fee spent across all compounds. */
-  totalCost: number
-  /** Total performance fee paid to the platform. */
-  totalPerformanceFee: number
+  totalGas: number
   /** Annualised effective rate implied by finalValue vs principal. */
   effectiveApr: number
 }
 
 /**
- * Realistic compounded projection: a daily simulation that accrues yield on the
- * live principal and compounds whenever the gate fires, deducting cost and fee.
- * Gas is modelled as coming out of harvested yield (conservative for display).
+ * Realistic compounded projection: a daily simulation that accrues yield on the live
+ * principal and compounds only when the marginal benefit over the *remaining*
+ * horizon beats the gas. Because each compound clears that bar, the result is always
+ * >= holding. Gas is modelled as coming out of the harvested fees (conservative).
  */
 export function projectCompounded(config: CompoundingConfig, horizonDays: number): CompoundedProjection {
   validate(config)
   if (horizonDays < 0) throw new Error('horizonDays must be >= 0')
 
   const days = Math.floor(horizonDays)
-  const feeRate = config.performanceFeeRate ?? 0
   let principal = config.principal
   let accrued = 0
   let compounds = 0
-  let totalCost = 0
-  let totalPerformanceFee = 0
+  let totalGas = 0
 
   for (let d = 0; d < days; d += 1) {
     accrued += (principal * config.apr) / DAYS_PER_YEAR
+    const remaining = days - d
     const stepConfig: CompoundingConfig = { ...config, principal }
-    if (shouldCompound(accrued, stepConfig)) {
+    if (shouldCompound(accrued, remaining, stepConfig)) {
       const cost = costPerCompound(stepConfig)
-      const gross = accrued - cost
-      const fee = gross > 0 ? gross * feeRate : 0
-      principal += netReinvested(accrued, stepConfig)
-      totalCost += cost
-      totalPerformanceFee += fee
+      principal += accrued - cost
       accrued = 0
+      totalGas += cost
       compounds += 1
     }
   }
@@ -151,7 +146,47 @@ export function projectCompounded(config: CompoundingConfig, horizonDays: number
     ? Math.pow(finalValue / config.principal, 1 / years) - 1
     : 0
 
-  return { finalValue, compounds, totalCost, totalPerformanceFee, effectiveApr }
+  return { finalValue, compounds, totalGas, effectiveApr }
+}
+
+/**
+ * Fixed-schedule ("manual") compounding: compound every `intervalDays` regardless of
+ * whether it beats the gas. Predictable, but a too-tight interval loses to gas — the
+ * card surfaces that honestly (the resulting value can dip below holding).
+ */
+export function projectManual(
+  config: CompoundingConfig,
+  horizonDays: number,
+  intervalDays: number,
+): CompoundedProjection {
+  validate(config)
+  if (horizonDays < 0) throw new Error('horizonDays must be >= 0')
+
+  const days = Math.floor(horizonDays)
+  const interval = Math.max(1, Math.floor(intervalDays))
+  let principal = config.principal
+  let accrued = 0
+  let compounds = 0
+  let totalGas = 0
+
+  for (let d = 1; d <= days; d += 1) {
+    accrued += (principal * config.apr) / DAYS_PER_YEAR
+    if (d % interval === 0 && accrued > 0) {
+      const cost = costPerCompound({ ...config, principal })
+      principal += accrued - cost
+      accrued = 0
+      totalGas += cost
+      compounds += 1
+    }
+  }
+
+  const finalValue = principal + accrued
+  const years = days / DAYS_PER_YEAR
+  const effectiveApr = years > 0 && config.principal > 0
+    ? Math.pow(finalValue / config.principal, 1 / years) - 1
+    : 0
+
+  return { finalValue, compounds, totalGas, effectiveApr }
 }
 
 export interface ProjectionPoint {
@@ -162,12 +197,15 @@ export interface ProjectionPoint {
 
 /**
  * Sampled curve of simple vs compounded value over the horizon, for the app card.
- * `points` is the number of samples (inclusive of day 0 and the horizon).
+ * `points` is the number of samples (inclusive of day 0 and the horizon). Pass
+ * `intervalDays` to model the fixed-schedule ("manual") mode; omit it for the
+ * gas-aware ("agent") gate.
  */
 export function projectionCurve(
   config: CompoundingConfig,
   horizonDays: number,
   points = 24,
+  intervalDays?: number,
 ): ProjectionPoint[] {
   validate(config)
   if (horizonDays <= 0 || points < 2) {
@@ -176,6 +214,7 @@ export function projectionCurve(
 
   const days = Math.floor(horizonDays)
   const sampleEvery = days / (points - 1)
+  const interval = intervalDays ? Math.max(1, Math.floor(intervalDays)) : undefined
 
   let principal = config.principal
   let accrued = 0
@@ -184,9 +223,13 @@ export function projectionCurve(
 
   for (let d = 1; d <= days; d += 1) {
     accrued += (principal * config.apr) / DAYS_PER_YEAR
+    const remaining = days - d
     const stepConfig: CompoundingConfig = { ...config, principal }
-    if (shouldCompound(accrued, stepConfig)) {
-      principal += netReinvested(accrued, stepConfig)
+    const doCompound = interval
+      ? d % interval === 0 && accrued > 0
+      : shouldCompound(accrued, remaining, stepConfig)
+    if (doCompound) {
+      principal += accrued - costPerCompound(stepConfig)
       accrued = 0
     }
     if (d >= nextSampleAt || d === days) {
