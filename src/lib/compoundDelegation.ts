@@ -150,6 +150,18 @@ export function buildCompoundMandate(params: CompoundMandateParams): CompoundMan
   return { delegation, terms, salt }
 }
 
+/**
+ * A stored compound delegation carries the human-readable `terms` next to the
+ * delegation, mirroring the recap/instruction export on the DCA and limit-order
+ * rails. The terms are salt-verifiable — `hashCompoundTerms(terms)` equals the
+ * signed delegation salt — so the agent can read `mode`/`intervalDays` from them
+ * without an out-of-band env var, and reject any file where they were tampered.
+ * The on-chain caveats remain the source of truth for what can be executed.
+ */
+export interface StoredCompoundDelegation extends StoredDelegation {
+  terms: CompoundTerms
+}
+
 /** Wrap a signed compound delegation for storage/export, matching StoredDelegation. */
 export function buildStoredCompoundDelegation(params: {
   mandate: CompoundMandate
@@ -157,11 +169,12 @@ export function buildStoredCompoundDelegation(params: {
   chainId: number
   safeAddress: Address
   moduleAddress: Address
-}): StoredDelegation {
+}): StoredCompoundDelegation {
   const { mandate, signature, chainId, safeAddress, moduleAddress } = params
   const signed: DelegationStruct = { ...mandate.delegation, signature }
   return {
     delegation: signed,
+    terms: mandate.terms,
     meta: {
       label: `Auto-compound (${mandate.terms.mode})`,
       scopeType: 'custom',

@@ -4,7 +4,7 @@ import { createPublicClient, http, isAddress, parseUnits, formatUnits, erc20Abi,
 import { useUniswapPools } from '../hooks/useUniswapPools'
 import { buildDepositPlan } from '../lib/uniswapPosition'
 import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
-import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode } from '../lib/compoundDelegation'
+import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
 import { getAddresses } from '../config/addresses'
@@ -13,10 +13,10 @@ import { DeleGatorModuleFactoryABI } from '../config/abis'
 import { DEFAULT_SALT } from '../lib/module'
 import { findChain, rpcUrl } from '../config/supported-chains'
 import type { PoolInfo } from '../lib/uniswapDiscovery'
-import type { StoredDelegation } from '../lib/storage'
 
-/** The signed yield plan, optionally carrying the auto-compound mandate. */
-type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredDelegation }
+/** The signed yield plan, optionally carrying the auto-compound mandate (with its
+ * salt-verifiable terms, so the agent needs no out-of-band interval config). */
+type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredCompoundDelegation }
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
 import { Block, Field } from '../ui/form'
 import { CompoundProjection } from '../ui/CompoundProjection'

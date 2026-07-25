@@ -31,18 +31,21 @@
  * The runner preflights the allowances every cycle and refuses to redeem, with
  * instructions, until they are in place.
  *
+ * Mode and (for manual) the compound interval are read from the plan's
+ * salt-verified `compound.terms` — no env var. The salt binds them to the
+ * signature, so a tampered plan file is rejected at startup.
+ *
  * Env: AGENT_PRIVATE_KEY, optional RPC_URL, optional POLL_SECONDS (default 3600),
  *      optional MAX_POLLS (0 = run forever), optional MAX_REVERTS (default 5),
- *      COMPOUND_INTERVAL_DAYS (required for a manual-mode mandate), optional
- *      APR_OVERRIDE, ETH_PRICE_IN_QUOTE (required only when neither pool token
- *      is WETH). Usage: bun run-compound.ts <yield-plan.json>
+ *      optional APR_OVERRIDE, ETH_PRICE_IN_QUOTE (required only when neither pool
+ *      token is WETH). Usage: bun run-compound.ts <yield-plan.json>
  *
  * Dependency: viem, @metamask/smart-accounts-kit. Node >= 20 (global fetch).
  */
 import { readFileSync } from 'node:fs'
 import {
   createPublicClient, createWalletClient, http, erc20Abi, isAddress,
-  encodeFunctionData, keccak256, encodePacked, encodeAbiParameters, toHex,
+  encodeFunctionData, keccak256, encodePacked, encodeAbiParameters, toHex, toBytes,
   type Address, type Hex, type Chain, type PublicClient, type WalletClient,
 } from 'viem'
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts'
@@ -90,10 +93,27 @@ interface DelegationStruct {
 
 type CompoundMode = 'agent' | 'manual'
 
-/** The `compound` entry of the yield-plan JSON (StoredDelegation in the app). */
+/** The salt-verifiable terms exported next to the delegation (see
+ * src/lib/compoundDelegation.ts CompoundTerms). `hashCompoundTerms(terms)` must
+ * equal the signed delegation salt — that binding is what lets the runner trust
+ * `mode`/`intervalDays` from the plan file instead of an out-of-band env var. */
+interface CompoundTermsExport {
+  schema: string
+  chainId: number
+  agent: Address
+  module: Address
+  safe: Address
+  positionManager: Address
+  pool: Address
+  mode: CompoundMode
+  intervalDays: number | null
+}
+
+/** The `compound` entry of the yield-plan JSON (StoredCompoundDelegation in the app). */
 interface StoredCompoundMandate {
   delegation: DelegationStruct
   meta: { label: string; delegationHash?: Hex; targetAddress?: Address }
+  terms?: CompoundTermsExport
 }
 
 interface PlanPool { address: Address; token0: Address; token1: Address; fee: number }
@@ -126,6 +146,27 @@ function computeDelegationHash(d: DelegationStruct): Hex {
     [{ type: 'bytes32' }, { type: 'address' }, { type: 'address' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }],
     [DELEGATION_TYPEHASH, d.delegate, d.delegator, d.authority, caveatsHash, BigInt(d.salt)],
   ))
+}
+
+// --- terms hash (must match src/lib/subscriptionTerms.ts canonicalize exactly) --
+
+/** Recursively sort object keys (arrays keep order), so the JSON is deterministic. */
+function sortDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortDeep)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value as Record<string, unknown>)
+        .sort()
+        .map((k) => [k, sortDeep((value as Record<string, unknown>)[k])]),
+    )
+  }
+  return value
+}
+
+/** Salt of a compound mandate: keccak256 of the canonical (sorted-key) terms JSON.
+ * Mirrors hashCompoundTerms in src/lib/compoundDelegation.ts — must stay in sync. */
+function hashCompoundTerms(terms: CompoundTermsExport): Hex {
+  return keccak256(toBytes(JSON.stringify(sortDeep(terms))))
 }
 
 // --- ABIs (inlined — only what this runner calls) -----------------------------
@@ -576,12 +617,6 @@ function optionalNumberEnv(name: string): number | null {
   return n
 }
 
-function parseCompoundMode(label: string): CompoundMode {
-  if (label.includes('(agent)')) return 'agent'
-  if (label.includes('(manual)')) return 'manual'
-  throw new Error(`cannot infer compound mode from mandate label "${label}" — expected "Auto-compound (agent|manual)"`)
-}
-
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 async function main() {
@@ -613,11 +648,25 @@ async function main() {
     throw new Error('The compound mandate is missing meta.targetAddress (the PositionManager it whitelists)')
   }
 
-  const mode = parseCompoundMode(compound.meta.label)
-  // The manual interval only survives export inside the signed terms hash (the
-  // salt), which is not invertible — so a manual-mode run takes it from the
-  // operator via env instead of guessing.
-  const intervalDays = mode === 'manual' ? requirePositiveNumberEnv('COMPOUND_INTERVAL_DAYS') : null
+  // Mode + interval come from the salt-verified terms exported in the plan (the
+  // recap pattern from the DCA/limit-order rails) — no out-of-band env var. The
+  // salt binds these to the signature, so a tampered file is rejected here.
+  const terms = compound.terms
+  if (!terms) {
+    throw new Error('The compound mandate has no exported terms — re-sign the plan in the Yield tab (older plans predate salt-verified terms).')
+  }
+  const termsSalt = hashCompoundTerms(terms)
+  if (termsSalt.toLowerCase() !== delegation.salt.toLowerCase()) {
+    throw new Error(`compound terms do not match the signed salt (terms hash ${termsSalt}, delegation salt ${delegation.salt}) — the plan file is tampered or malformed`)
+  }
+  if (terms.positionManager.toLowerCase() !== positionManager.toLowerCase()) {
+    throw new Error(`terms.positionManager (${terms.positionManager}) disagrees with the whitelisted target (${positionManager})`)
+  }
+  const mode = terms.mode
+  const intervalDays = mode === 'manual' ? terms.intervalDays : null
+  if (mode === 'manual' && !(intervalDays && intervalDays > 0)) {
+    throw new Error('manual-mode mandate is missing a positive intervalDays in its terms')
+  }
 
   const privateKey = requireEnv('AGENT_PRIVATE_KEY') as Hex // hex-validated by privateKeyToAccount below
   const account = privateKeyToAccount(privateKey)
