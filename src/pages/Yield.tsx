@@ -5,6 +5,7 @@ import { useUniswapPools } from '../hooks/useUniswapPools'
 import { buildDepositPlan } from '../lib/uniswapPosition'
 import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
 import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
+import { checkCompoundApprovals, buildCompoundApprovalSetup } from '../lib/compoundApproval'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
 import { getAddresses } from '../config/addresses'
@@ -83,6 +84,10 @@ export default function Yield() {
   const [autoCompound, setAutoCompound] = useState(false)
   const [compoundMode, setCompoundMode] = useState<CompoundMode>('agent')
   const [compoundIntervalDays, setCompoundIntervalDays] = useState(30)
+  // The standing Safe→PositionManager approval the compound agent needs at run time
+  // (null = unknown/not applicable yet). Separate from signing the mandate.
+  const [compoundApprovalReady, setCompoundApprovalReady] = useState<boolean | null>(null)
+  const [compoundApprovalBusy, setCompoundApprovalBusy] = useState(false)
 
   const recommended = pools[0] ?? null
   const pool = selectedPool ?? recommended
@@ -91,6 +96,7 @@ export default function Yield() {
   const [agent, setAgent] = useState(() => (import.meta.env.VITE_YIELD_AGENT_ADDRESS as string | undefined) ?? '')
   const agentValid = isAddress(agent)
   const agentAddress = agentValid ? (agent as Address) : undefined
+  const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
 
   useEffect(() => {
     if (!pool) {
@@ -133,6 +139,62 @@ export default function Yield() {
   )
   const projectionApr = pool?.apy ?? DEFAULT_PROJECTION_APR
   const aprIsEstimate = pool?.apy == null
+
+  // Does the Safe already have a standing approval to the PositionManager for both
+  // pool tokens? The compound agent's increaseLiquidity pulls them at run time, so
+  // without it a compound reverts. Only relevant while auto-compound is on.
+  useEffect(() => {
+    if (!autoCompound || !pool || !positionManager || amount0Raw <= 0n || amount1Raw <= 0n) {
+      setCompoundApprovalReady(null)
+      return
+    }
+    const chain = findChain(safe.chainId)
+    if (!chain) return
+    const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
+    let cancelled = false
+    checkCompoundApprovals(client, {
+      safe: safe.safeAddress as Address,
+      positionManager,
+      token0: pool.token0.address,
+      token1: pool.token1.address,
+    })
+      .then((s) => { if (!cancelled) setCompoundApprovalReady(s.ready) })
+      .catch(() => { if (!cancelled) setCompoundApprovalReady(null) })
+    return () => { cancelled = true }
+  }, [autoCompound, pool, positionManager, amount0Raw, amount1Raw, safe.chainId, safe.safeAddress, compoundApprovalBusy])
+
+  async function handleEnableCompounding() {
+    if (!pool || !positionManager) return
+    setPlanError(null)
+    setCompoundApprovalBusy(true)
+    try {
+      const chain = findChain(safe.chainId)
+      if (!chain) throw new Error('Unsupported chain')
+      const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
+      const status = await checkCompoundApprovals(client, {
+        safe: safe.safeAddress as Address,
+        positionManager,
+        token0: pool.token0.address,
+        token1: pool.token1.address,
+      })
+      // Cap the approval at the deposit amounts — the agent only reinvests harvested
+      // fees (small vs principal), so this bounds the blast radius to ~1x the position
+      // while comfortably covering realistic fee accrual (see FUTURE.md for the
+      // per-period caveat that supersedes this before production).
+      const txs = buildCompoundApprovalSetup(
+        { positionManager, token0: pool.token0.address, token1: pool.token1.address, cap0: amount0Raw, cap1: amount1Raw },
+        status,
+      )
+      if (txs.length === 0) { setCompoundApprovalReady(true); return }
+      // One batched Safe transaction (both approvals) — a single signing action. The
+      // Safe tx is async (multisig); the effect re-checks once it mines.
+      await sdk.txs.send({ txs })
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to enable compounding')
+    } finally {
+      setCompoundApprovalBusy(false)
+    }
+  }
 
   async function handleDelegate() {
     if (!pool || !agentAddress) return
@@ -206,7 +268,6 @@ export default function Yield() {
       // bounded to collect + increaseLiquidity on this pool's PositionManager — and
       // attach it to the plan. The agent redeems it repeatedly to harvest+reinvest.
       if (autoCompound) {
-        const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
         if (!positionManager) throw new Error(`Uniswap PositionManager not configured for chain ${safe.chainId}`)
         const mandate = buildCompoundMandate({
           chainId: safe.chainId,
@@ -389,6 +450,21 @@ export default function Yield() {
             enabled={autoCompound}
             onToggle={setAutoCompound}
           />
+
+          {autoCompound && compoundApprovalReady === false && (
+            <div
+              className="rounded-xl ring-1 p-3 space-y-2"
+              style={{ background: 'var(--accent-soft)', borderColor: 'var(--accent-line)' }}
+            >
+              <p className="text-[11px] text-dim leading-relaxed">
+                One-time setup: approve the Safe's {pool.token0.symbol} and {pool.token1.symbol} to the position manager so
+                the agent can reinvest harvested fees. Capped at your deposit — the agent can never pull more.
+              </p>
+              <Btn kind="ghost" size="sm" onClick={handleEnableCompounding} disabled={compoundApprovalBusy} className="w-full">
+                {compoundApprovalBusy ? 'Submitting…' : 'Enable compounding'}
+              </Btn>
+            </div>
+          )}
 
           {planError && (
             <div className="flex items-center gap-2 text-pending text-sm">
