@@ -5,7 +5,7 @@ import { DeleGatorModuleFactoryABI, SafeABI } from '../config/abis'
 import { getAddresses } from '../config/addresses'
 import { buildModuleInstallTxs, DEFAULT_SALT } from '../lib/module'
 import { getDelegations, type StoredDelegation } from '../lib/storage'
-import { isLimitOrderRedeemed } from '../lib/limitOrderStatus'
+import { getLimitOrderExecution } from '../lib/limitOrderStatus'
 import { portalAtomUrl } from '../lib/intuition'
 import { periodToSeconds, isPeriodType } from '../lib/enforcers'
 import { SubscriptionDetail } from './SubscriptionDetail'
@@ -21,18 +21,18 @@ function tintFor(addr: string): { tint: string; logo: string } {
   for (let i = 2; i < addr.length; i++) h = (h * 31 + addr.charCodeAt(i)) >>> 0
   return { tint: palette[h % palette.length], logo: addr.slice(2, 4).toUpperCase() }
 }
-function statusOf(s: StoredDelegation['meta']['status'], redeemed = false): Status {
-  if (redeemed) return 'redeemed'
+function statusOf(s: StoredDelegation['meta']['status'], executed = false): Status {
+  if (executed) return 'executed'
   return s === 'signed' ? 'active' : s === 'revoked' ? 'revoked' : 'pending'
 }
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
 
-function SubCard({ d, onOpen, redeemed }: { d: StoredDelegation; onOpen: () => void; redeemed?: boolean }) {
-  const status = statusOf(d.meta.status, redeemed)
+function SubCard({ d, onOpen, executedTx }: { d: StoredDelegation; onOpen: () => void; executedTx?: string }) {
+  const status = statusOf(d.meta.status, executedTx !== undefined)
   const stream = d.meta.scopeType === 'erc20Streaming'
   const payeeAddr = d.meta.recipient ?? d.delegation.delegate
   const { tint, logo } = tintFor(payeeAddr)
-  const dim = status === 'revoked' || status === 'redeemed'
+  const dim = status === 'revoked' || status === 'executed'
   return (
     <Card hover onClick={onOpen} className={`p-5 cursor-pointer relative ${dim ? 'opacity-70' : ''}`}>
       <span className="absolute left-0 top-5 bottom-5 w-[3px] rounded-full" style={{ background: STATUS[status].dot }} />
@@ -40,7 +40,14 @@ function SubCard({ d, onOpen, redeemed }: { d: StoredDelegation; onOpen: () => v
         <Payee logo={logo} tint={tint} name={d.meta.label} addr={short(payeeAddr)} />
         <div className="flex items-center gap-2 shrink-0">
           {stream && <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide" style={{ color: '#22D3EE' }}><IconRepeat size={11} /> stream</span>}
-          <StatusBadge status={status} size="sm" />
+          {status === 'executed' && executedTx ? (
+            <a href={executedTx} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="inline-flex items-center gap-1" title="View execution tx">
+              <StatusBadge status={status} size="sm" />
+              <IconExt size={12} className="text-faint" />
+            </a>
+          ) : (
+            <StatusBadge status={status} size="sm" />
+          )}
         </div>
       </div>
       <div className="mt-5 flex items-end gap-2">
@@ -95,15 +102,19 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
   const [safeInfo, setSafeInfo] = useState<{ owners: string[]; threshold: number } | null>(null)
   const [subs, setSubs] = useState<StoredDelegation[]>(() => getDelegations())
   const [selected, setSelected] = useState<StoredDelegation | null>(null)
-  // Limit orders are one-shot; once fired on-chain, show them as Redeemed not Active.
-  const [redeemedHashes, setRedeemedHashes] = useState<Set<string>>(new Set())
+  // Limit orders are one-shot; once fired on-chain, show them as Executed not Active,
+  // with a link to the redemption tx. Keyed by delegationHash → explorer URL ('' = no link).
+  const [executed, setExecuted] = useState<Map<string, string>>(new Map())
 
   useEffect(() => {
     const orders = subs.filter((d) => d.meta.strategyKind === 'limitOrder' && d.meta.status === 'signed')
     if (orders.length === 0) return
     let cancelled = false
-    Promise.all(orders.map(async (d) => ((await isLimitOrderRedeemed(d.meta.chainId, d.meta.delegationHash)) ? d.meta.delegationHash.toLowerCase() : null)))
-      .then((hits) => { if (!cancelled) setRedeemedHashes(new Set(hits.filter((h): h is string => h !== null))) })
+    Promise.all(orders.map(async (d) => {
+      const ex = await getLimitOrderExecution(d.meta.chainId, d.meta.delegationHash, d.meta.createdAt)
+      return ex.executed ? ([d.meta.delegationHash.toLowerCase(), ex.txUrl ?? ''] as const) : null
+    }))
+      .then((hits) => { if (!cancelled) setExecuted(new Map(hits.filter((h): h is readonly [string, string] => h !== null))) })
       .catch(() => {})
     return () => { cancelled = true }
   }, [subs])
@@ -258,7 +269,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
       ) : (
         <div className="grid grid-cols-2 gap-4">
           {subs.map((d) => (
-            <SubCard key={d.meta.delegationHash} d={d} onOpen={() => setSelected(d)} redeemed={redeemedHashes.has(d.meta.delegationHash.toLowerCase())} />
+            <SubCard key={d.meta.delegationHash} d={d} onOpen={() => setSelected(d)} executedTx={executed.get(d.meta.delegationHash.toLowerCase())} />
           ))}
         </div>
       )}

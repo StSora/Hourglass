@@ -227,7 +227,9 @@ export default function LimitOrder() {
         <div className="space-y-5">
           <Block title="Agent">
             <p className="text-xs text-dim -mt-1 leading-relaxed">
-              You run the agent (via the Hourglass skill). Paste its address; the rest stays locked until you do.
+              You run the agent (via the{' '}
+              <a href="https://github.com/intuition-box/Hourglass/tree/main/skills/hourglass-agent" target="_blank" rel="noreferrer" className="font-medium underline underline-offset-2" style={{ color: '#34D399' }}>Hourglass skill</a>
+              ). Paste its address; the rest stays locked until you do.
             </p>
             <Field label="Agent address" required missing={agent !== '' && !agentValid}>
               <input type="text" placeholder="0x…" value={agent} onChange={(e) => setAgent(e.target.value)} className={`font-mono ${agent && !agentValid ? 'ring-1 ring-danger' : ''}`} />
