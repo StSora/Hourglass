@@ -2,6 +2,18 @@
 
 Deferred ideas captured during tasks (per workflow rules — scope discipline).
 
+- **[DCA] The DCA rail needs the same Permit2 setup the limit order got.** Proven on
+  the limit order: the Uniswap Universal Router 2.0 pulls the funding token through
+  Permit2 (verified — `check_approval` always returns the Permit2 spender on Base, no
+  legacy toggle exposed; the `/swap` calldata is a bare `V3_SWAP_EXACT_IN` with no inline
+  `PERMIT2_PERMIT`). So `run-dca.ts`'s approve+swap redeem hits `AllowanceExpired` too
+  unless the Safe has a standing Permit2 allowance for the router. The fix mirrors the
+  limit order: a one-time "Enable trading" setup (`src/lib/permit2.ts`) + drop the
+  in-mandate approve, redeeming the swap alone. Until then the DCA docs are stale:
+  `getting-started.mdx` (line ~59, "approve directly to the router, not Permit2") and
+  `references/execution-dca.md` ("approve + swap in one atomic call") describe the
+  pre-Permit2 flow. Deferred with the rest of DCA.
+
 - **Multi-token redeem stats.** `StatsRow` / `sumDisplay` on the Charge page sum
   claimable/claimed across token groups under a single hardcoded "USDC" label.
   Correct for the current USDC-centric POC (amounts are grouped per token with
