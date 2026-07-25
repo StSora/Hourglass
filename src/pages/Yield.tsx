@@ -342,6 +342,7 @@ export default function Yield() {
             apr={projectionApr}
             aprIsEstimate={aprIsEstimate}
             poolLabel={`${pool.token0.symbol}/${pool.token1.symbol} · ${feeLabel(pool.fee)}`}
+            chainId={safe.chainId}
             enabled={autoCompound}
             onToggle={setAutoCompound}
           />

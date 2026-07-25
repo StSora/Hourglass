@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   projectSimple,
   projectCompounded,
@@ -10,9 +10,25 @@ import {
 import { IconRepeat, IconGas } from './icons'
 import { Segmented, PreviewRow } from './form'
 
-// Display estimate — the projection is illustrative, not a quote. The real gas and
-// APR are resolved at run time by the agent / venue.
-const COMPOUND_GAS_USD = 0.15
+// Rough per-chain estimate of a compound (collect + increaseLiquidity) tx cost in
+// USD, for the PROJECTION only — L2s are cents, mainnet is gas-heavy. This is a
+// forecast assumption, not a quote: the agent reads the real live gas at execution
+// and only compounds when it clears the benefit.
+const COMPOUND_GAS_USD_BY_CHAIN: Record<number, number> = {
+  1: 12, // Ethereum mainnet
+  8453: 0.15, // Base
+  84532: 0.15, // Base Sepolia
+  11155111: 0.05, // Ethereum Sepolia
+  10: 0.15, // Optimism
+  42161: 0.2, // Arbitrum
+  137: 0.05, // Polygon
+  130: 0.15, // Unichain
+}
+const DEFAULT_COMPOUND_GAS_USD = 0.5
+
+function estimateCompoundGasUsd(chainId: number): number {
+  return COMPOUND_GAS_USD_BY_CHAIN[chainId] ?? DEFAULT_COMPOUND_GAS_USD
+}
 
 type Mode = 'agent' | 'manual'
 
@@ -54,6 +70,7 @@ export function CompoundProjection({
   apr,
   aprIsEstimate = false,
   poolLabel,
+  chainId,
   enabled,
   onToggle,
 }: {
@@ -61,6 +78,7 @@ export function CompoundProjection({
   apr: number
   aprIsEstimate?: boolean
   poolLabel?: string
+  chainId: number
   enabled: boolean
   onToggle: (v: boolean) => void
 }) {
@@ -68,24 +86,40 @@ export function CompoundProjection({
   const [mode, setMode] = useState<Mode>('agent')
   const [intervalDays, setIntervalDays] = useState(30)
 
+  const gasUsd = estimateCompoundGasUsd(chainId)
+
+  // Only offer intervals that fit inside the projection window — a longer interval
+  // would never fire (e.g. quarterly over a 1-month window = 0 compounds).
+  const availableIntervals = INTERVALS.filter((i) => Number(i.key) <= horizonDays)
+  useEffect(() => {
+    if (intervalDays > horizonDays) {
+      const fits = availableIntervals.map((i) => Number(i.key))
+      setIntervalDays(fits.length ? Math.max(...fits) : Number(INTERVALS[0].key))
+    }
+  }, [horizonDays, intervalDays, availableIntervals])
+
   const config = useMemo<CompoundingConfig>(
-    () => ({ principal: positionValueUsd, apr, gasCost: COMPOUND_GAS_USD }),
-    [positionValueUsd, apr],
+    () => ({ principal: positionValueUsd, apr, gasCost: gasUsd }),
+    [positionValueUsd, apr, gasUsd],
   )
 
+  // In Agent mode the agent picks the moment, so there is no user schedule — the
+  // projection is a fixed 1-year forecast. Manual mode exposes the horizon + interval.
+  const effectiveHorizon = mode === 'agent' ? 365 : horizonDays
+
   const hasValue = positionValueUsd > 0 && apr > 0
-  const simple = useMemo(() => projectSimple(config, horizonDays), [config, horizonDays])
+  const simple = useMemo(() => projectSimple(config, effectiveHorizon), [config, effectiveHorizon])
   const comp = useMemo(
-    () => (mode === 'agent' ? projectCompounded(config, horizonDays) : projectManual(config, horizonDays, intervalDays)),
-    [config, horizonDays, mode, intervalDays],
+    () => (mode === 'agent' ? projectCompounded(config, effectiveHorizon) : projectManual(config, effectiveHorizon, intervalDays)),
+    [config, effectiveHorizon, mode, intervalDays],
   )
   const nextDays = useMemo(
-    () => (mode === 'agent' ? nextCompoundEstimateDays(config, horizonDays) : intervalDays),
-    [config, horizonDays, mode, intervalDays],
+    () => (mode === 'agent' ? nextCompoundEstimateDays(config, effectiveHorizon) : intervalDays),
+    [config, effectiveHorizon, mode, intervalDays],
   )
   const curve = useMemo(
-    () => projectionCurve(config, horizonDays, 32, mode === 'manual' ? intervalDays : undefined),
-    [config, horizonDays, mode, intervalDays],
+    () => projectionCurve(config, effectiveHorizon, 32, mode === 'manual' ? intervalDays : undefined),
+    [config, effectiveHorizon, mode, intervalDays],
   )
   const extra = comp.finalValue - simple
   const extraPositive = extra >= -1e-6
@@ -126,7 +160,9 @@ export function CompoundProjection({
         </label>
       </div>
 
-      {!hasValue ? (
+      {!enabled ? (
+        <p className="text-xs text-faint">Turn on to project compounding for this position.</p>
+      ) : !hasValue ? (
         <p className="text-xs text-faint">Enter amounts to see the projection.</p>
       ) : (
         <>
@@ -139,18 +175,20 @@ export function CompoundProjection({
               value={mode}
               onChange={(v) => setMode(v)}
             />
-            <Segmented
-              options={HORIZONS.map((h) => ({ key: h.key, label: h.label }))}
-              value={String(horizonDays)}
-              onChange={(v) => setHorizonDays(Number(v))}
-            />
+            {mode === 'manual' && (
+              <Segmented
+                options={HORIZONS.map((h) => ({ key: h.key, label: h.label }))}
+                value={String(horizonDays)}
+                onChange={(v) => setHorizonDays(Number(v))}
+              />
+            )}
           </div>
 
           {mode === 'manual' && (
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[11px] text-faint">Compound</span>
+              <span className="text-[11px] text-faint">Compound every</span>
               <Segmented
-                options={INTERVALS.map((i) => ({ key: i.key, label: i.label }))}
+                options={availableIntervals.map((i) => ({ key: i.key, label: i.label }))}
                 value={String(intervalDays)}
                 onChange={(v) => setIntervalDays(Number(v))}
               />
@@ -211,7 +249,10 @@ export function CompoundProjection({
               <span className="text-ink text-xs">{mode === 'agent' ? humanDays(nextDays) : humanDays(intervalDays)}</span>
             </PreviewRow>
             <PreviewRow label="Gas / compound">
-              <span className="font-mono text-dim tnum text-xs">{usd(COMPOUND_GAS_USD)}</span>
+              <span className="font-mono text-dim tnum text-xs">
+                {usd(gasUsd)}
+                <span className="text-faint"> · est.</span>
+              </span>
             </PreviewRow>
           </div>
 
