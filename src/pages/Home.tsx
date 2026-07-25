@@ -7,7 +7,6 @@ import { buildModuleInstallTxs, DEFAULT_SALT } from '../lib/module'
 import { getDelegations, type StoredDelegation } from '../lib/storage'
 import { getLimitOrderExecution } from '../lib/limitOrderStatus'
 import { portalAtomUrl } from '../lib/intuition'
-import { periodToSeconds, isPeriodType } from '../lib/enforcers'
 import { SubscriptionDetail } from './SubscriptionDetail'
 import { Card, Btn, StatusBadge, Payee, STATUS, type Status } from '../ui/components'
 import { IconChip, IconCheck, IconPlus, IconRepeat, IconLock, IconCube, IconExt, IconAlert, IconArrowR } from '../ui/icons'
@@ -185,13 +184,14 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
   }
 
   const active = subs.filter((s) => s.meta.status === 'signed')
-  // Monthly run-rate: normalise each active subscription's amount to a per-month
-  // figure from its period, so a daily/weekly/minutely cap still contributes.
-  const SECONDS_PER_MONTH = Number(periodToSeconds('monthly'))
+  // Total engaged: the plain sum of each active mandate's headline amount — the same
+  // figure shown on its card (a stream shows its per-period rate, everything else its
+  // amount). No per-period normalisation, so a limit order (period 'swap') or any
+  // non-recurring mandate is counted too.
   const committed = active.reduce((sum, s) => {
-    const amount = parseFloat((s.meta.amount ?? '0').replace(/,/g, ''))
-    if (!Number.isFinite(amount) || !isPeriodType(s.meta.period)) return sum
-    return sum + amount * (SECONDS_PER_MONTH / Number(periodToSeconds(s.meta.period)))
+    const shown = s.meta.scopeType === 'erc20Streaming' ? s.meta.ratePerPeriod : s.meta.amount
+    const amount = parseFloat((shown ?? '0').replace(/,/g, ''))
+    return Number.isFinite(amount) ? sum + amount : sum
   }, 0)
 
   return (
@@ -252,9 +252,9 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
       {/* Stats (no ETH-spent / gasless stat by design choice) */}
       <div className="mb-6">
         <Card className="p-4">
-          <div className="flex items-center gap-2 text-xs text-faint"><IconRepeat size={16} /> Committed / month</div>
+          <div className="flex items-center gap-2 text-xs text-faint"><IconRepeat size={16} /> Total engaged</div>
           <div className="mt-2 font-mono font-bold text-ink tnum" style={{ fontSize: 24 }}>${committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>
-          <div className="text-xs text-dim mt-1">{active.length} active subscription{active.length === 1 ? '' : 's'}</div>
+          <div className="text-xs text-dim mt-1">{active.length} active mandate{active.length === 1 ? '' : 's'}</div>
         </Card>
       </div>
 
