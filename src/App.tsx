@@ -6,11 +6,12 @@ import Charge from './pages/Charge'
 import Yield from './pages/Yield'
 import Strategy from './pages/Strategy'
 import LimitOrder from './pages/LimitOrder'
+import Aqua from './pages/Aqua'
 import { useFinalizePending } from './hooks/useFinalizePending'
 import { Logo, Card } from './ui/components'
-import { IconGrid, IconPlus, IconBolt, IconRepeat, IconLock, IconArrowR, IconTrend, IconStop } from './ui/icons'
+import { IconGrid, IconPlus, IconBolt, IconRepeat, IconLock, IconArrowR, IconTrend, IconStop, IconCube } from './ui/icons'
 
-type Page = 'home' | 'create' | 'redeem' | 'yield' | 'strategy' | 'limit'
+type Page = 'home' | 'create' | 'redeem' | 'yield' | 'strategy' | 'limit' | 'aqua'
 type CreateMode = 'choose' | 'subscription' | 'stream'
 
 const NAV: { key: Page; label: string; icon: ComponentType<{ size?: number }> }[] = [
@@ -22,6 +23,7 @@ const NAV: { key: Page; label: string; icon: ComponentType<{ size?: number }> }[
   // (needs the Permit2 setup the limit order got). Code kept; re-add when it works.
   // { key: 'strategy', label: 'Strategy', icon: IconRepeat },
   { key: 'limit', label: 'Limit order', icon: IconStop },
+  { key: 'aqua', label: 'Aqua', icon: IconCube },
 ]
 
 function ChoiceCard({
@@ -152,6 +154,7 @@ function AppInner() {
           {page === 'yield' && <Yield />}
           {page === 'strategy' && <Strategy />}
           {page === 'limit' && <LimitOrder />}
+          {page === 'aqua' && <Aqua />}
         </main>
       </div>
     </div>
