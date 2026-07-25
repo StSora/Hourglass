@@ -2,7 +2,7 @@
 import { useState, type ButtonHTMLAttributes, type ReactNode } from 'react'
 import { IconBolt, IconCheck, IconCopy } from './icons'
 
-export type Status = 'active' | 'pending' | 'revoked' | 'redeemed'
+export type Status = 'active' | 'pending' | 'revoked' | 'executed'
 
 // eslint-disable-next-line react-refresh/only-export-components -- shared design tokens, not a route module
 export const STATUS: Record<Status, { label: string; color: string; dot: string; soft: string; line: string }> = {
@@ -10,7 +10,7 @@ export const STATUS: Record<Status, { label: string; color: string; dot: string;
   pending: { label: 'Pending', color: '#FBBF24', dot: '#FBBF24', soft: 'rgba(251,191,36,.12)', line: 'rgba(251,191,36,.30)' },
   revoked: { label: 'Revoked', color: '#FB7185', dot: '#FB7185', soft: 'rgba(251,113,133,.12)', line: 'rgba(251,113,133,.28)' },
   // A one-shot limit order that has fired (limitedCalls exhausted). Neutral slate — done, not an error.
-  redeemed: { label: 'Redeemed', color: '#94A3B8', dot: '#94A3B8', soft: 'rgba(148,163,184,.12)', line: 'rgba(148,163,184,.28)' },
+  executed: { label: 'Executed', color: '#94A3B8', dot: '#94A3B8', soft: 'rgba(148,163,184,.12)', line: 'rgba(148,163,184,.28)' },
 }
 
 /** The Ripl mark — a fan of strokes that fades grey → white, the streaming-payments signature.
